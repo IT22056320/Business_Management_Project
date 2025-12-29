@@ -10,7 +10,7 @@ RUN apk add --no-cache maven
 # Copy dependency files first for better layer caching
 COPY pom.xml .
 
-# Download dependencies
+# Download dependencies offline
 RUN mvn dependency:go-offline -B
 
 # Copy source code
@@ -33,25 +33,29 @@ LABEL java.version="17"
 LABEL spring.boot.version="3.1.3"
 
 # Install security updates and monitoring tools
-RUN apk update && apk upgrade && apk add --no-cache curl tzdata && rm -rf /var/cache/apk/*
+RUN apk update && apk upgrade && \
+    apk add --no-cache curl tzdata && \
+    rm -rf /var/cache/apk/*
 
 # Create non-root user
-RUN addgroup -g 1000 springuser && adduser -D -u 1000 -G springuser springuser
+RUN addgroup -g 1000 springuser && \
+    adduser -D -u 1000 -G springuser springuser
 
 # Create application directories
-RUN mkdir -p /app/logs /app/tmp
-
-# Set proper permissions
-RUN chown -R springuser:springuser /app
-
-# Switch to non-root user
-USER springuser
+RUN mkdir -p /app/logs /app/tmp && \
+    chown -R springuser:springuser /app
 
 # Set working directory
 WORKDIR /app
 
 # Copy JAR from builder stage
 COPY --from=builder /build/target/app.jar app.jar
+
+# Change ownership of application files
+RUN chown springuser:springuser app.jar
+
+# Switch to non-root user
+USER springuser
 
 # Environment variables
 ENV TZ=UTC
@@ -61,16 +65,22 @@ ENV DB_USERNAME=
 ENV DB_PASSWORD=
 
 # JVM optimization options
-ENV JAVA_OPTS="-XX:+UseContainerSupport -XX:MaxRAMPercentage=75.0 -XX:+UseG1GC -XX:+UseStringDeduplication -Djava.security.egd=file:/dev/./urandom -Dspring.profiles.active=prod"
+ENV JAVA_OPTS="-XX:+UseContainerSupport \
+    -XX:MaxRAMPercentage=75.0 \
+    -XX:+UseG1GC \
+    -XX:+UseStringDeduplication \
+    -Djava.security.egd=file:/dev/./urandom \
+    -Dspring.profiles.active=prod"
 
-# Expose port
+# Expose application port
 EXPOSE 2330
 
-# Volume for logs
+# Volume for log persistence
 VOLUME ["/app/logs"]
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s CMD curl -f http://localhost:2330/ || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
+    CMD curl -f http://localhost:2330/ || exit 1
 
 # Entry point with proper signal handling
 ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar app.jar"]
