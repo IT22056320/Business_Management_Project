@@ -44,17 +44,14 @@ RUN mkdir -p /app/logs /app/tmp
 # Set proper permissions
 RUN chown -R springuser:springuser /app
 
+# Switch to non-root user
+USER springuser
+
 # Set working directory
 WORKDIR /app
 
 # Copy JAR from builder stage
 COPY --from=builder /build/target/app.jar app.jar
-
-# Change ownership of the JAR file
-RUN chown springuser:springuser app.jar
-
-# Switch to non-root user
-USER springuser
 
 # Environment variables
 ENV TZ=UTC
@@ -73,8 +70,7 @@ EXPOSE 2330
 VOLUME ["/app/logs"]
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s \
-  CMD curl -f http://localhost:2330/ || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 --start-period=60s CMD curl -f http://localhost:2330/ || exit 1
 
 # Entry point with proper signal handling
 ENTRYPOINT ["sh", "-c", "exec java $JAVA_OPTS -jar app.jar"]

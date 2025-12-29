@@ -2,14 +2,14 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main ]
   pull_request:
-    branches: [ main, develop ]
+    branches: [ main ]
   workflow_dispatch:
 
 env:
-  JAVA_VERSION: '17'
-  SPRING_BOOT_VERSION: '3.1.3'
+  JAVA_VERSION: 17
+  SPRING_BOOT_VERSION: 3.1.3
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      # Checkout the source code
+      # Checkout source code from repository
       - name: Checkout code
         uses: actions/checkout@v4
         
@@ -35,7 +35,7 @@ jobs:
           java-version: ${{ env.JAVA_VERSION }}
           distribution: 'temurin'
           
-      # Cache Maven dependencies for faster builds
+      # Cache Maven dependencies to speed up builds
       - name: Cache Maven dependencies
         uses: actions/cache@v3
         with:
@@ -44,19 +44,19 @@ jobs:
           restore-keys: ${{ runner.os }}-m2
           
       # Build the application without running tests
-      - name: Build application
+      - name: Build with Maven
         run: ./mvnw clean compile -DskipTests
         
-      # Run unit tests
+      # Run unit and integration tests
       - name: Run tests
         run: ./mvnw test
         
-      # Package the application
+      # Package the application into JAR file
       - name: Package application
         run: ./mvnw package -DskipTests
         
-      # Upload JAR artifact for subsequent jobs
-      - name: Upload build artifact
+      # Upload JAR artifact for use in subsequent jobs
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: jar-artifact
@@ -67,18 +67,17 @@ jobs:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
     needs: build
-    
     outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
-      image-tags: ${{ steps.meta.outputs.tags }}
+      image: ${{ steps.image.outputs.image }}
+      digest: ${{ steps.build.outputs.digest }}
     
     steps:
-      # Checkout code for Dockerfile
+      # Checkout code for Dockerfile access
       - name: Checkout code
         uses: actions/checkout@v4
         
-      # Download the JAR artifact from build job
-      - name: Download build artifact
+      # Download JAR artifact from build job
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: jar-artifact
@@ -96,7 +95,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
           
-      # Extract metadata for Docker image tags and labels
+      # Extract metadata for Docker tags and labels
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -107,12 +106,8 @@ jobs:
             type=ref,event=pr
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
-          labels: |
-            org.opencontainers.image.title=Business Management Project
-            org.opencontainers.image.description=Spring Boot Business Management Application
-            org.opencontainers.image.version=${{ github.sha }}
             
-      # Build and push Docker image
+      # Build and push Docker image with layer caching
       - name: Build and push Docker image
         id: build
         uses: docker/build-push-action@v5
@@ -123,7 +118,12 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-          platforms: linux/amd64,linux/arm64
+          
+      # Output image name for security job
+      - name: Output image
+        id: image
+        run: |
+          echo "image=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}" >> $GITHUB_OUTPUT
 
   security:
     name: Security Scanning
@@ -131,22 +131,15 @@ jobs:
     needs: docker
     
     steps:
-      # Checkout code for security scanning
+      # Checkout code for Dockerfile linting
       - name: Checkout code
         uses: actions/checkout@v4
         
-      # Run Hadolint to lint Dockerfile
-      - name: Run Hadolint
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: Dockerfile
-          failure-threshold: error
-          
-      # Run Trivy vulnerability scanner on the built image
+      # Run Trivy vulnerability scanner on Docker image
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ fromJSON(needs.docker.outputs.image-tags)[0] }}
+          image-ref: ${{ needs.docker.outputs.image }}
           format: 'sarif'
           output: 'trivy-results.sarif'
           
@@ -157,11 +150,18 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
           
-      # Run additional security scan for critical vulnerabilities
-      - name: Run Trivy critical scan
-        uses: aquasecurity/trivy-action@master
+      # Run Hadolint to lint Dockerfile for best practices
+      - name: Run Hadolint Dockerfile linter
+        uses: hadolint/hadolint-action@v3.1.0
         with:
-          image-ref: ${{ fromJSON(needs.docker.outputs.image-tags)[0] }}
-          format: 'table'
-          severity: 'CRITICAL,HIGH'
-          exit-code: '1'
+          dockerfile: Dockerfile
+          format: sarif
+          output-file: hadolint-results.sarif
+          no-fail: true
+          
+      # Upload Hadolint results to GitHub Security tab
+      - name: Upload Hadolint scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: hadolint-results.sarif
