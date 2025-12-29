@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      # Checkout the source code
+      # Checkout source code
       - name: Checkout code
         uses: actions/checkout@v4
         
@@ -39,27 +39,37 @@ jobs:
       - name: Cache Maven dependencies
         uses: actions/cache@v3
         with:
-          path: ~/.m2
-          key: ${{ runner.os }}-m2-${{ hashFiles('**/pom.xml') }}
-          restore-keys: ${{ runner.os }}-m2
-          
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+            
       # Build the application without running tests
       - name: Build application
         run: ./mvnw clean compile -DskipTests
         
-      # Run unit tests
+      # Run unit and integration tests
       - name: Run tests
         run: ./mvnw test
         
+      # Generate test reports
+      - name: Publish test results
+        uses: dorny/test-reporter@v1
+        if: success() || failure()
+        with:
+          name: Maven Tests
+          path: target/surefire-reports/*.xml
+          reporter: java-junit
+          
       # Package the application
       - name: Package application
         run: ./mvnw package -DskipTests
         
-      # Upload JAR artifact for subsequent jobs
-      - name: Upload build artifact
+      # Upload JAR artifact for next jobs
+      - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
         with:
-          name: jar-artifact
+          name: spring-boot-jar
           path: target/*.jar
           retention-days: 1
 
@@ -68,23 +78,19 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     
-    outputs:
-      image-digest: ${{ steps.build.outputs.digest }}
-      image-tags: ${{ steps.meta.outputs.tags }}
-    
     steps:
       # Checkout code for Dockerfile
       - name: Checkout code
         uses: actions/checkout@v4
         
-      # Download the JAR artifact from build job
-      - name: Download build artifact
+      # Download JAR artifact from build job
+      - name: Download JAR artifact
         uses: actions/download-artifact@v4
         with:
-          name: jar-artifact
+          name: spring-boot-jar
           path: target/
           
-      # Setup Docker Buildx for advanced build features
+      # Setup Docker Buildx for advanced features
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         
@@ -96,7 +102,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
           
-      # Extract metadata for Docker image tags and labels
+      # Extract metadata for tags and labels
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -107,14 +113,42 @@ jobs:
             type=ref,event=pr
             type=sha,prefix={{branch}}-
             type=raw,value=latest,enable={{is_default_branch}}
-          labels: |
-            org.opencontainers.image.title=Business Management Project
-            org.opencontainers.image.description=Spring Boot Business Management Application
-            org.opencontainers.image.version=${{ github.sha }}
             
-      # Build and push Docker image
+      # Create Dockerfile if it doesn't exist
+      - name: Create Dockerfile
+        run: |
+          if [ ! -f Dockerfile ]; then
+            cat > Dockerfile << 'EOF'
+          FROM openjdk:17-jre-slim
+          
+          WORKDIR /app
+          
+          # Add application user for security
+          RUN addgroup --system spring && adduser --system spring --ingroup spring
+          
+          # Copy JAR file
+          COPY target/*.jar app.jar
+          
+          # Change ownership to application user
+          RUN chown spring:spring app.jar
+          
+          # Switch to non-root user
+          USER spring:spring
+          
+          # Expose application port
+          EXPOSE 2330
+          
+          # Health check
+          HEALTHCHECK --interval=30s --timeout=3s --start-period=60s --retries=3 \
+            CMD curl -f http://localhost:2330/actuator/health || exit 1
+          
+          # Run application
+          ENTRYPOINT ["java", "-jar", "app.jar"]
+          EOF
+          fi
+          
+      # Build and push Docker image with caching
       - name: Build and push Docker image
-        id: build
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -135,33 +169,53 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         
-      # Run Hadolint to lint Dockerfile
+      # Run Hadolint on Dockerfile
       - name: Run Hadolint
         uses: hadolint/hadolint-action@v3.1.0
         with:
           dockerfile: Dockerfile
           failure-threshold: error
           
-      # Run Trivy vulnerability scanner on the built image
+      # Login to registry to pull image for scanning
+      - name: Login to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+          
+      # Extract image name for security scan
+      - name: Extract image name
+        id: image
+        run: |
+          IMAGE_NAME="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            TAG="pr-${{ github.event.number }}"
+          else
+            TAG="${{ github.ref_name }}-${{ github.sha }}"
+          fi
+          echo "image=${IMAGE_NAME}:${TAG}" >> $GITHUB_OUTPUT
+          
+      # Run Trivy vulnerability scanner
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ fromJSON(needs.docker.outputs.image-tags)[0] }}
+          image-ref: ${{ steps.image.outputs.image }}
           format: 'sarif'
           output: 'trivy-results.sarif'
           
       # Upload Trivy scan results to GitHub Security tab
       - name: Upload Trivy scan results
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v2
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
           
-      # Run additional security scan for critical vulnerabilities
-      - name: Run Trivy critical scan
+      # Run Trivy for high/critical vulnerabilities only (fail build)
+      - name: Run Trivy scanner (fail on high/critical)
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ${{ fromJSON(needs.docker.outputs.image-tags)[0] }}
+          image-ref: ${{ steps.image.outputs.image }}
           format: 'table'
-          severity: 'CRITICAL,HIGH'
+          severity: 'HIGH,CRITICAL'
           exit-code: '1'
